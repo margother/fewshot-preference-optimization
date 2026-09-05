@@ -213,8 +213,25 @@ class BasicTrainer(object):
         
            We do this to avoid doing two forward passes, because it's faster for FSDP.
         """
+        # dpo_LRF-side change: use_cache=False -- see chat: "can you investigate on
+        # the training problem?" (job 328758's own real CheckpointError: recomputed
+        # KV tensor at position 29/30 had seq_len 9160 vs. the forward pass's own
+        # 4580 -- exactly double). Root cause: this repo's own requirements.txt pins
+        # transformers==4.45.2; our own env pins 4.57.6 (needed for Qwen3 support,
+        # unavailable in 4.45.2). Without use_cache=False, the model builds a
+        # DynamicCache during forward; newer transformers mutates that cache object
+        # in place as each decoder layer runs. FSDP's non-reentrant activation
+        # checkpointing (wrapped per Qwen3DecoderLayer, see FSDPTrainer.__init__'s
+        # own apply_activation_checkpointing call) assumes the checkpointed forward
+        # is pure -- recompute during backward() re-runs the same layer forward, but
+        # the cache object still holds the entries from the FIRST run, so the second
+        # run appends on top, doubling the KV seq_len it sees. 4.45.2-era caching
+        # never mutated state this way, so this never surfaced upstream -- a
+        # version-upgrade regression, not an FSPO bug. No cache is needed here
+        # anyway (a single forward pass over the full sequence, not incremental
+        # decoding), so disabling it is free.
         concatenated_batch = concatenated_inputs(batch)
-        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask']).logits.to(torch.float32)
+        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], use_cache=False).logits.to(torch.float32)
         all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
         chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
         rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
@@ -228,9 +245,29 @@ class BasicTrainer(object):
         train_test = 'train' if train else 'eval'
 
         if loss_config.name in {'dpo', 'ipo'}:
-            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
+            # dpo_LRF-side change: reference forward moved BEFORE policy's (was
+            # policy-then-reference) -- see chat: "what's happening with FSPO?"
+            # thread, jobs 328753/328755's own identical OOM (10.66GiB short,
+            # reference_model's own concatenated_forward -> log_softmax over the
+            # full vocab). Root cause: activation checkpointing only helps a
+            # tensor that will be used for backward() -- reference_model's own
+            # forward already runs under torch.no_grad() (no graph built at
+            # all), so checkpointing it (the earlier attempt) was a genuine
+            # no-op, which is exactly why that fix produced an IDENTICAL OOM
+            # number. The real conflict is policy's own RETAINED activation
+            # graph (kept for the eventual loss.backward(), after this method
+            # returns) competing with reference's own transient log_softmax
+            # spike (same size, momentary). Running reference's no-grad,
+            # transient-memory forward FIRST -- while nothing is retained yet
+            # -- then policy's graph-building forward second, decouples the
+            # two peaks instead of stacking them; policy's own forward already
+            # succeeds on its own (that's the whole reason THIS specific call
+            # is what OOMs, not policy's), so this ordering costs nothing and
+            # only removes memory pressure. Purely a scheduling/infra change --
+            # same final loss/logps values either way, no methodology impact.
             with torch.no_grad():
                 reference_chosen_logps, reference_rejected_logps = self.concatenated_forward(self.reference_model, batch)
+            policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
 
             if loss_config.name == 'dpo':
                 loss_kwargs = {'beta': loss_config.beta, 'reference_free': loss_config.reference_free, 'label_smoothing': loss_config.label_smoothing, 'ipo': False}
@@ -257,7 +294,15 @@ class BasicTrainer(object):
             metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
         elif loss_config.name == 'sft':
-            policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
+            # dpo_LRF-side change: use_cache=False -- see concatenated_forward's
+            # own comment for the full root-cause writeup (DynamicCache mutated
+            # during forward, incompatible with FSDP non-reentrant checkpoint
+            # recompute). Job 328887's own real failure: THIS branch, not
+            # concatenated_forward -- job 328758's config is loss.name=sft, which
+            # never calls concatenated_forward at all, so fixing that method alone
+            # left this direct self.policy(...) call still exposed. Same fix,
+            # same reasoning, just the SFT-specific forward call site.
+            policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask'], use_cache=False).logits.to(torch.float32)
             policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False)
 
             losses = -policy_chosen_logps
@@ -443,6 +488,24 @@ class FSDPTrainer(BasicTrainer):
         wrap_class = get_block_class_from_model(policy, config.model.block_name)
         model_auto_wrap_policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={wrap_class},)
 
+        # use_orig_params -- real bug found in job 330309 (fspo LoRA sanity
+        # check, second OOM/error in the same investigation): with LoRA
+        # active, a wrapped block mixes FROZEN base weights (requires_grad=
+        # False) and TRAINABLE lora_A/lora_B adapter params (requires_grad=
+        # True) -- FSDP's own default flattening (use_orig_params=False)
+        # requires every tensor in a flat param group to share the SAME
+        # requires_grad, and raises `ValueError: Must flatten tensors with
+        # uniform requires_grad when use_orig_params=False` otherwise.
+        # use_orig_params=True keeps each parameter as its own object
+        # instead of flattening the whole block together, which handles
+        # mixed frozen/trainable params fine -- see chat: "can we fix the
+        # previous problems with dim1/refproblog/prlhf/fspo?" -> LoRA
+        # sanity check thread. Scoped to PERSONALLLM_LORA=1 only -- the
+        # plain full-fine-tuning path (every param in a wrapped block
+        # trainable alike) never hits this, and is already working/running
+        # for other n10 methods, so its own use_orig_params=False stays
+        # byte-identical unless a launcher explicitly opts into LoRA.
+        use_orig_params = os.environ.get("PERSONALLLM_LORA", "0") == "1"
         shared_fsdp_kwargs = dict(
             auto_wrap_policy=model_auto_wrap_policy,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -451,7 +514,7 @@ class FSDPTrainer(BasicTrainer):
             device_id=rank,
             ignored_modules=None,
             limit_all_gathers=False,
-            use_orig_params=False,
+            use_orig_params=use_orig_params,
             sync_module_states=False
         )
 
@@ -460,7 +523,25 @@ class FSDPTrainer(BasicTrainer):
         policy_mp_policy = MixedPrecision(param_dtype=mp_dtype, reduce_dtype=mp_dtype, buffer_dtype=mp_dtype)
         self.policy = FSDP(policy, **shared_fsdp_kwargs, mixed_precision=policy_mp_policy)
 
+        if config.loss.name in {'dpo', 'ipo'}:
+            rank0_print('Sharding reference model...')
+            self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
+
         if config.activation_checkpointing:
+            # dpo_LRF-side change (see chat: "what's happening with FSPO?" thread,
+            # job 328753's own real OOM) -- the ORIGINAL version of this block only
+            # ever wrapped self.policy, never self.reference_model, even though
+            # both get FSDP-sharded above. For dpo/ipo, self.reference_model's own
+            # concatenated_forward is called every training step too (get_batch_
+            # metrics) and is exactly as memory-hungry as the policy's -- job
+            # 328753 OOM'd specifically in reference_model's own _get_batch_logps
+            # (10.66GiB short, no fragmentation) after policy's own checkpointing
+            # alone got 3 real IPO steps in. This is a real, targeted memory-
+            # management fix (not touching loss/retrieval/architecture -- same
+            # "avoid refining their method" carve-out already used for
+            # gradient_accumulation_steps/PYTORCH_CUDA_ALLOC_CONF this session),
+            # not a change to what activation_checkpointing=true was already
+            # supposed to mean.
             rank0_print('Attempting to enable activation checkpointing...')
             try:
                 # use activation checkpointing, according to:
@@ -483,12 +564,11 @@ class FSDPTrainer(BasicTrainer):
                 check_fn = lambda submodule: isinstance(submodule, wrap_class)
                 rank0_print('Applying activation checkpointing wrapper to policy...')
                 apply_activation_checkpointing(self.policy, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
+                if config.loss.name in {'dpo', 'ipo'}:
+                    rank0_print('Applying activation checkpointing wrapper to reference model...')
+                    apply_activation_checkpointing(self.reference_model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
                 rank0_print('FSDP activation checkpointing enabled!')
 
-        if config.loss.name in {'dpo', 'ipo'}:
-            rank0_print('Sharding reference model...')
-            self.reference_model = FSDP(reference_model, **shared_fsdp_kwargs)
-        
         print('Loaded model on rank', rank)
         dist.barrier()
 

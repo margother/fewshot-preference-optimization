@@ -87,12 +87,66 @@ def main(config: DictConfig):
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
 
+    # PERSONALLLM_LORA opt-in -- see chat: "does IPO use LoRa?!" -> "is it
+    # trivial to change the fine-tuning to Lora in their code?" -> "I think
+    # this is fair to the other methods... run a new sanity check with
+    # fewshot=8 but a lora adaptor with the same parameters we've been
+    # using". Full fine-tuning (self.optimizer over self.policy.parameters()
+    # -- ALL of them, trainers.py's own real mechanism, confirmed directly)
+    # is what caused every prior IPO-stage OOM here, none of which were
+    # about LoRA at all -- this makes FSPO's own memory profile match the
+    # other (already LoRA-based) methods instead of full-fine-tuning a
+    # whole 3B model + full RMSprop state for it. Same r/alpha/dropout/
+    # target_modules DPO/D-DPO/DPO-LRF's own canonical LoRA config already
+    # uses (method_hyperparameters.py), not a fresh choice. reference_model
+    # (below) deliberately stays a plain full frozen copy, NOT also LoRA-
+    # wrapped -- no gradient/optimizer memory to save there since it's
+    # already frozen, and it keeps this change minimal/localized rather
+    # than restructuring trainers.py's own concatenated_forward to a
+    # reference-free (same-weights-adapter-disabled) scheme. Env-var gated,
+    # default off -- qwen's own existing full-fine-tuning pipeline stays
+    # byte-identical unless a launcher explicitly opts in (same pattern as
+    # PERSONALLLM_NUM_SHOTS).
+    if os.environ.get("PERSONALLLM_LORA", "0") == "1":
+        from peft import LoraConfig, get_peft_model
+        lora_config = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,
+                                  target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+        policy = get_peft_model(policy, lora_config)
+        # get_peft_model() creates the new lora_A/lora_B adapter matrices
+        # in float32 by default, regardless of the base model's own dtype
+        # -- real bug found in job 330127 (sanity check): FSDP's own
+        # FlatParamHandle refuses to shard a module whose parameters have
+        # mixed dtypes ("Must flatten tensors with uniform dtype but got
+        # torch.bfloat16 and torch.float32"), which every base param here
+        # already is (policy_dtype above). Cast the whole (now LoRA-
+        # wrapped) model back to policy_dtype -- a no-op on the already-
+        # bfloat16 base weights, fixes only the new adapter params.
+        policy = policy.to(policy_dtype)
+        policy.print_trainable_parameters()
+
     if config.loss.name in {'dpo', 'ipo'}:
         print('building reference model')
         reference_model_dtype = getattr(torch, config.model.reference_dtype)
         reference_model = transformers.AutoModelForCausalLM.from_pretrained(
             config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, **model_kwargs)
         disable_dropout(reference_model)
+        # MUST also be LoRA-wrapped, same config as policy above, when
+        # PERSONALLLM_LORA=1 -- NOT for its own training (reference_model
+        # is never in self.optimizer's own parameter list, trainers.py's
+        # own real mechanism, confirmed directly -- it's pure eval/no_grad
+        # forward passes), but because config.model.archive's own
+        # reference_model.load_state_dict(state_dict['state']) a few lines
+        # below loads the SAME state dict the (now PEFT-wrapped) policy
+        # saved -- a plain, unwrapped model would key-mismatch against a
+        # PeftModel's own state_dict (renamed/prefixed base keys + real new
+        # lora_A/lora_B tensors that don't exist on a plain model at all).
+        # This also correctly represents WHAT the IPO stage's reference
+        # actually needs to be: the SFT-tuned policy (base + its trained
+        # adapter), not the raw pretrained model with no adapter at all.
+        if os.environ.get("PERSONALLLM_LORA", "0") == "1":
+            reference_model = get_peft_model(reference_model, lora_config)
+            # Same float32-adapter-vs-bfloat16-base dtype fix as policy above.
+            reference_model = reference_model.to(reference_model_dtype)
     else:
         reference_model = None
 

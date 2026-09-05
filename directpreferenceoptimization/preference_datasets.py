@@ -341,6 +341,28 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
         data = get_review(split, silent=silent, cache_dir=cache_dir, include_disprefferred=True, include_level=include_level, autolabel=False, num_shots=8)
     elif name == 'roleplay':
         data = get_roleplay(split, silent=silent, cache_dir=cache_dir, num_shots=8, include_disprefferred=True, add_persona=False, include_level=include_level)
+    elif name == 'personalllm':
+        # Registration for the personalllm comparison -- see
+        # ../fspo_personalllm/personalllm_data.py's own module docstring
+        # (num_shots=4/include_disprefferred=True match this file's own
+        # elix convention, not review/roleplay's -- see that file's own
+        # comment for why). This is the ONLY edit
+        # made to this vendored file -- everything else (shots_to_text,
+        # get_elix/get_review/get_roleplay, the loss/trainer code) is
+        # untouched, same as every other dataset's own registration here.
+        import sys, os as _os
+        sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "fspo_personalllm"))
+        from personalllm_data import get_personalllm
+        data = get_personalllm(split=split, silent=silent)
+    elif name == 'prism':
+        # Registration for the PRISM comparison -- see
+        # ../fspo_prism/prism_data.py's own module docstring. Own env vars
+        # (PRISM_TRAIN_PATH/_TEST_PATH, not the PERSONALLLM_* ones) so a
+        # PRISM run and a personalllm run never clobber each other's paths.
+        import sys, os as _os
+        sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "fspo_prism"))
+        from prism_data import get_prism
+        data = get_prism(split=split, silent=silent)
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
