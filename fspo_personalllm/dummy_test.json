@@ -1,0 +1,122 @@
+[
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 0",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 1",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 2",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 3",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 4",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 5",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 6",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 7",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 8",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 9",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 10",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 11",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 12",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 13",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 14",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 15",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 16",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 17",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 18",
+    "chosen": "a",
+    "rejected": "b"
+  },
+  {
+    "user_id": "dummy_user",
+    "prompt": "dummy prompt 19",
+    "chosen": "a",
+    "rejected": "b"
+  }
+]

@@ -1,0 +1,12 @@
+# Added for the personalllm comparison (this repo ships llama/gpt2/gptj/
+# pythia configs only, no Qwen entry at all) -- matches this project's own
+# GOB_MODEL_PATH (Qwen/Qwen3-0.6B), same base model every other method
+# (DPO, DPO-LRF, P-RLHF) is compared on.
+name_or_path: Qwen/Qwen3-0.6B
+tokenizer_name_or_path: null
+archive: null
+block_name: Qwen3DecoderLayer
+
+policy_dtype: bfloat16
+fsdp_policy_mp: null
+reference_dtype: bfloat16
