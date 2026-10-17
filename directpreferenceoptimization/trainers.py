@@ -88,6 +88,18 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
     return losses, chosen_rewards, rejected_rewards
 
 
+# FSPO_SELECTIVE_LOGPS=1 -- single-A6000 LoRA memory fix (see chat: "make FSPO run with LoRA on a single A6000 GPU"). The original path casts the WHOLE (batch, seq, vocab) logits tensor to
+# float32 and then log_softmax-es it again: at seq 6144, vocab 128,256 and a chosen+rejected pair that is ~6.3 GB + another ~6.3 GB (+ their backward copies) -- the real cause of every
+# earlier OOM (jobs 330122/125/310: "Tried to allocate 12-15 GiB" inside log_softmax; LoRA only shrinks the optimizer state, never this activation). With this flag the logits stay in
+# their own dtype and only the response positions (labels != -100, a few hundred tokens out of thousands of few-shot-context tokens) are cast to float32 and log-softmax-ed. Same sum /
+# mean of the same per-token log-probs, hence the same loss; default OFF so every existing launcher stays byte-identical.
+_SELECTIVE_LOGPS = os.environ.get("FSPO_SELECTIVE_LOGPS", "0") == "1"
+
+
+def _maybe_fp32(logits: torch.Tensor) -> torch.Tensor:
+    return logits if _SELECTIVE_LOGPS else logits.to(torch.float32)
+
+
 def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, average_log_prob: bool = False) -> torch.FloatTensor:
     """Compute the log probabilities of the given labels under the given logits.
 
@@ -104,6 +116,12 @@ def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, averag
     labels = labels[:, 1:].clone()
     logits = logits[:, :-1, :]
     loss_mask = (labels != -100)
+
+    if _SELECTIVE_LOGPS:
+        b_idx, t_idx = loss_mask.nonzero(as_tuple=True)                       # response positions only
+        sel_logps = torch.gather(logits[b_idx, t_idx].float().log_softmax(-1), dim=1, index=labels[b_idx, t_idx].unsqueeze(1)).squeeze(1)
+        sums = torch.zeros(labels.shape[0], dtype=torch.float32, device=labels.device).index_add(0, b_idx, sel_logps)
+        return sums / loss_mask.sum(-1) if average_log_prob else sums
 
     # dummy token; we'll ignore the losses on these tokens later
     labels[labels == -100] = 0
@@ -231,7 +249,8 @@ class BasicTrainer(object):
         # anyway (a single forward pass over the full sequence, not incremental
         # decoding), so disabling it is free.
         concatenated_batch = concatenated_inputs(batch)
-        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], use_cache=False).logits.to(torch.float32)
+        all_logits = model(concatenated_batch['concatenated_input_ids'], attention_mask=concatenated_batch['concatenated_attention_mask'], use_cache=False).logits
+        all_logits = _maybe_fp32(all_logits)
         all_logps = _get_batch_logps(all_logits, concatenated_batch['concatenated_labels'], average_log_prob=False)
         chosen_logps = all_logps[:batch['chosen_input_ids'].shape[0]]
         rejected_logps = all_logps[batch['chosen_input_ids'].shape[0]:]
@@ -302,7 +321,8 @@ class BasicTrainer(object):
             # never calls concatenated_forward at all, so fixing that method alone
             # left this direct self.policy(...) call still exposed. Same fix,
             # same reasoning, just the SFT-specific forward call site.
-            policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask'], use_cache=False).logits.to(torch.float32)
+            policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask'], use_cache=False).logits
+            policy_chosen_logits = _maybe_fp32(policy_chosen_logits)
             policy_chosen_logps = _get_batch_logps(policy_chosen_logits, batch['chosen_labels'], average_log_prob=False)
 
             losses = -policy_chosen_logps
@@ -418,6 +438,9 @@ class BasicTrainer(object):
             self.optimizer.zero_grad()
 
             step_time = time.time() - start_time
+            if os.environ.get("FSPO_LOG_MEM", "0") == "1" and torch.cuda.is_available():
+                rank0_print(f'[mem] step {self.batch_counter}: peak allocated {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB, peak reserved {torch.cuda.max_memory_reserved() / 2**30:.1f} GiB, step {step_time:.1f}s')
+                torch.cuda.reset_peak_memory_stats()
             examples_per_second = self.config.batch_size / step_time
             batch_metrics['examples_per_second'].append(examples_per_second)
             batch_metrics['grad_norm'].append(grad_norm)

@@ -114,6 +114,11 @@ def parse_args():
                     help="MUST match the checkpoint's own training num_shots -- see "
                          "fspo_personalllm/personalllm_data.py's own default.")
     p.add_argument("--include-dispreferred", action="store_true", default=True)
+    p.add_argument("--max-prompt-length", type=int, default=512,
+                    help="Cap on the (few-shot) prompt tokens, keep_start -- FSPO's own tokenize_batch_element truncation mode in training "
+                         "(truncation_mode='keep_start' for every non-hh dataset). Same value as every other method's prompt cap "
+                         "(SHARED_MAX_PROMPT_LENGTH). NOTE training only truncates when prompt+response exceeds max_length; here it is applied "
+                         "unconditionally, since there is no response yet. 0 disables.")
     p.add_argument("--n-adapt-examples", type=int, default=None,
                     help="Caps each user's own --train-path pool to its first N rows before "
                          "--num-shots are taken from it -- same convention as eval/generate.py's "
@@ -152,7 +157,18 @@ def main():
     state_dict = torch.load(args.archive, map_location="cpu")
     step, metrics = state_dict["step_idx"], state_dict.get("metrics", {})
     print(f"  checkpoint step={step} metrics={metrics}", flush=True)
-    model.load_state_dict(state_dict["state"])
+    if os.environ.get("PERSONALLLM_LORA", "0") == "1":
+        # The checkpoint was written by a LoRA-wrapped policy (directpreferenceoptimization/train.py, PERSONALLLM_LORA=1): its keys are PeftModel keys (base_layer + lora_A/lora_B), so the
+        # SAME LoraConfig (same env source as training: method_hyperparameters.py --method DPO's LORA_*) must wrap the model before load_state_dict(), then the adapter is merged for generation.
+        from peft import LoraConfig, get_peft_model
+        lora_config = LoraConfig(task_type="CAUSAL_LM", r=int(os.environ["LORA_R"]), lora_alpha=int(os.environ["LORA_ALPHA"]),
+                                 lora_dropout=float(os.environ["LORA_DROPOUT"]), target_modules=os.environ["LORA_TARGET_MODULES"].split())
+        model = get_peft_model(model, lora_config).to(torch.bfloat16)
+        model.load_state_dict(state_dict["state"])
+        model = model.merge_and_unload()
+        print("  LoRA policy loaded and merged", flush=True)
+    else:
+        model.load_state_dict(state_dict["state"])
     model.eval()
     model.cuda()
 
@@ -229,6 +245,8 @@ def main():
 
     total_pairs = sum(len(u["prompts"]) for u in users.values())
     done = sum(len(v) for v in answers.values())
+    n_truncated = 0
+    _done0 = done
     t0 = time.time()
     with torch.no_grad():
         for uid, u in users.items():
@@ -254,7 +272,11 @@ def main():
                     include_dispreferred=args.include_dispreferred,
                     add_persona=False,
                 )
-                input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to("cuda")
+                input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+                if args.max_prompt_length and input_ids.shape[1] > args.max_prompt_length:
+                    input_ids = input_ids[:, :args.max_prompt_length]   # keep_start, as in FSPO training
+                    n_truncated += 1
+                input_ids = input_ids.to("cuda")
                 # do_sample=True, no temperature/top_p/top_k override -- see
                 # chat: "I think I would use the Qwen recommended defaults
                 # everywhere... For any method that is not ours, we just use
@@ -298,6 +320,7 @@ def main():
               f"(pool shorter than --num-shots, not skipped -- see chat: \"use the min thing\")",
               flush=True)
 
+    print(f"=== {n_truncated} prompts truncated to {args.max_prompt_length} tokens (keep_start) ===", flush=True)
     print(f"wrote {args.output_path}", flush=True)
 
     # Timing sidecar, same convention as dpo_LRF/eval/generate.py's own
@@ -311,8 +334,13 @@ def main():
     # works.
     with open(os.path.join(os.path.dirname(args.output_path),
                             f"generation_timing_alpha{dataset['metadata']['alpha']}.json"), "w") as f:
-        json.dump({"inference_time_seconds": time.time() - t0,
-                    "adaptation_time_seconds": adaptation_time_seconds}, f)
+        import socket as _socket
+        # timing_scope v2 (dpo_LRF/timing_scope.py): model/tokenizer/checkpoint loading excluded (all before t0 / _adapt_t0); adaptation =
+        # building each user's few-shot context; inference = this invocation's generation loop (a resumed run only times what it generated).
+        json.dump({"timing_scope": "v2_no_model_loading", "inference_time_seconds": time.time() - t0,
+                    "adaptation_time_seconds": adaptation_time_seconds,
+                    "hardware": f"{torch.cuda.get_device_name(0)} x{torch.cuda.device_count()} @ {_socket.gethostname()}",
+                    "n_generations": total_pairs, "n_generations_this_run": done - _done0}, f)
 
     print("[INFO] Script execution completed successfully.", flush=True)
 

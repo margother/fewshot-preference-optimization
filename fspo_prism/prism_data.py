@@ -45,15 +45,20 @@ def get_prism(
     silent: bool = False,
     num_shots: int = int(os.environ.get("PRISM_NUM_SHOTS", 4)),
     include_disprefferred: bool = True,
+    env_prefix: str = "PRISM",
 ) -> Dict[str, Dict[str, Union[List, str]]]:
+    # env_prefix: the SAME windowing for another dataset whose train.json has this row shape (Community Alignment -> "CA", our Roleplay pairs -> "ROLEPLAY"); reads
+    # {prefix}_TRAIN_PATH / {prefix}_TEST_PATH / {prefix}_NUM_SHOTS. "PRISM" = the original behaviour, byte-identical.
+    if env_prefix != "PRISM":
+        num_shots = int(os.environ.get(f"{env_prefix}_NUM_SHOTS", num_shots))
     if split == "test":
         # .get() with a fallback -- same env-inheritance-flake defense
         # personalllm_data.py's own get_personalllm already applies (job
         # 328737's own real crash under mp.spawn), applied here on the
         # same principle even though not yet observed for PRISM.
-        data_path = os.environ.get("PRISM_TEST_PATH") or os.environ["PRISM_TRAIN_PATH"]
+        data_path = os.environ.get(f"{env_prefix}_TEST_PATH") or os.environ[f"{env_prefix}_TRAIN_PATH"]
     else:
-        data_path = os.environ["PRISM_TRAIN_PATH"]
+        data_path = os.environ[f"{env_prefix}_TRAIN_PATH"]
     with open(data_path) as f:
         rows = json.load(f)
 

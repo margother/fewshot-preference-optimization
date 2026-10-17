@@ -363,6 +363,13 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
         sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "fspo_prism"))
         from prism_data import get_prism
         data = get_prism(split=split, silent=silent)
+    elif name in ('community_alignment', 'roleplay_pairs'):
+        # Same windowing as 'prism' (../fspo_prism/prism_data.py) on our Community Alignment / Roleplay seen train.json; own env vars ({CA,ROLEPLAY}_TRAIN_PATH ...).
+        # 'roleplay_pairs' -- NOT 'roleplay': that name is the original repo's own Roleplay dataset (get_roleplay) above.
+        import sys, os as _os
+        sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "fspo_prism"))
+        from prism_data import get_prism
+        data = get_prism(split=split, silent=silent, env_prefix='CA' if name == 'community_alignment' else 'ROLEPLAY')
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 

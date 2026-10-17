@@ -86,6 +86,12 @@ def main(config: DictConfig):
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
     disable_dropout(policy)
+    # Single-GPU path (trainer=BasicTrainer): FSDP is not used, so its activation checkpointing (FSDPTrainer.__init__'s apply_activation_checkpointing) does not exist either -- use HF's own
+    # gradient checkpointing instead, non-reentrant (the sequences are up to 6144 tokens: without it the activations of 28 layers do not fit next to the two model copies). Done BEFORE the
+    # LoRA wrap so PEFT inherits it. FSDPTrainer runs are untouched.
+    if config.trainer == 'BasicTrainer' and config.activation_checkpointing:
+        policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print('gradient checkpointing enabled (HF, non-reentrant) for the BasicTrainer policy')
 
     # PERSONALLLM_LORA opt-in -- see chat: "does IPO use LoRa?!" -> "is it
     # trivial to change the fine-tuning to Lora in their code?" -> "I think
@@ -109,8 +115,18 @@ def main(config: DictConfig):
     # PERSONALLLM_NUM_SHOTS).
     if os.environ.get("PERSONALLLM_LORA", "0") == "1":
         from peft import LoraConfig, get_peft_model
-        lora_config = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,
-                                  target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+        # LoRA hyperparameters come from the SAME source of truth DPO / DPO-LRF / D-DPO use -- dpo_LRF/method_hyperparameters.py (LORA_R / LORA_ALPHA / LORA_DROPOUT /
+        # LORA_TARGET_MODULES, exported by `method_hyperparameters.py --method DPO`), so "FSPO uses the same LoRA as DPO" is true by construction, not by a copy of the numbers
+        # here (see chat: "I want it to run with the same ranks etc. that we use for DPO"). Fallback = the current canonical values, with a loud warning, only so an older launcher
+        # that does not export them keeps working.
+        if all(k in os.environ for k in ("LORA_R", "LORA_ALPHA", "LORA_DROPOUT", "LORA_TARGET_MODULES")):
+            _lora = dict(r=int(os.environ["LORA_R"]), lora_alpha=int(os.environ["LORA_ALPHA"]), lora_dropout=float(os.environ["LORA_DROPOUT"]),
+                         target_modules=os.environ["LORA_TARGET_MODULES"].split())
+        else:
+            print("WARNING: LORA_R/LORA_ALPHA/LORA_DROPOUT/LORA_TARGET_MODULES not exported -- using the hardcoded canonical DPO values (r=8, alpha=16, dropout=0.05, q_proj v_proj)")
+            _lora = dict(r=8, lora_alpha=16, lora_dropout=0.05, target_modules=["q_proj", "v_proj"])
+        print(f"LoRA config: {_lora}")
+        lora_config = LoraConfig(task_type="CAUSAL_LM", **_lora)
         policy = get_peft_model(policy, lora_config)
         # get_peft_model() creates the new lora_A/lora_B adapter matrices
         # in float32 by default, regardless of the base model's own dtype
