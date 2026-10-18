@@ -19,8 +19,8 @@ load_state_dict(state_dict['state'])"). This script reproduces that exactly
 via --sft-archive, so the "reference" here matches what the checkpoint was
 ACTUALLY trained against, not some other baseline.
 
-Test split: get_personalllm() is now split-aware (see fspo_personalllm/
-personalllm_data.py's own comment) -- split="test" reads PERSONALLLM_
+Test split: get_fewshot_dataset() is now split-aware (see fspo_generic/
+dataset_data.py's own comment) -- split="test" reads PERSONALLLM_
 TEST_PATH and windows it with the SAME num_shots/reshuffle mechanism as
 training, just applied to the held-out test.json instead of train.json
 (both few-shot context AND target question/chosen/rejected come from the
@@ -74,7 +74,7 @@ def parse_args():
     p.add_argument("--model-name", default="Qwen/Qwen3-0.6B")
     p.add_argument("--num-shots", type=int, default=4,
                     help="MUST match the checkpoint's own training num_shots -- see "
-                         "fspo_personalllm/personalllm_data.py's own default.")
+                         "fspo_generic/dataset_data.py's own default.")
     p.add_argument("--beta", type=float, default=0.01,
                     help="MUST match the checkpoint's own training loss.beta -- doesn't affect "
                          "accuracy itself (beta-invariant sign comparison, see module docstring), "

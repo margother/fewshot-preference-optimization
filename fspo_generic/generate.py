@@ -112,7 +112,7 @@ def parse_args():
     p.add_argument("--model-name", default="Qwen/Qwen3-0.6B")
     p.add_argument("--num-shots", type=int, default=4,
                     help="MUST match the checkpoint's own training num_shots -- see "
-                         "fspo_personalllm/personalllm_data.py's own default.")
+                         "fspo_generic/dataset_data.py's own default.")
     p.add_argument("--include-dispreferred", action="store_true", default=True)
     p.add_argument("--max-prompt-length", type=int, default=512,
                     help="Cap on the (few-shot) prompt tokens, keep_start -- FSPO's own tokenize_batch_element truncation mode in training "
