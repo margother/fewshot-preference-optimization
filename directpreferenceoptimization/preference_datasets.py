@@ -503,8 +503,15 @@ def get_batch_iterator(names: List[str],
     with TemporarilySeededRandom(seed):
         permutation_seeds = iter(np.random.randint(0, 2**32, size=1000000))
         flat_data = []
+        # keep_end for our own few-shot datasets too, not just 'hh' -- see chat: "should we
+        # activate truncate left?". shots_to_text() puts the real target question LAST, after
+        # all num_shots few-shot blocks; keep_start (the else branch) truncates a too-long prompt
+        # from v[:max_prompt_length], which cuts the END of the string -- i.e. the actual
+        # question the model must answer, not spare few-shot context. keep_end (v[-max_prompt_
+        # length:]) drops the EARLIEST few-shot blocks instead and always preserves the question.
+        _KEEP_END_NAMES = ('hh', 'personalllm', 'prism', 'community_alignment', 'roleplay_pairs')
         for name in names:
-            truncation_mode = 'keep_end' if name == 'hh' else 'keep_start'
+            truncation_mode = 'keep_end' if name in _KEEP_END_NAMES else 'keep_start'
             for prompt, data in get_dataset(name, split, silent=silent, cache_dir=cache_dir, include_level=include_level).items():
                 flat_data.append((prompt, data['responses'], data['pairs'], data['sft_target'], truncation_mode, {"metadata": data.get("metadata")}))
 
