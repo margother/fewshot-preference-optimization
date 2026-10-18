@@ -157,8 +157,8 @@ def main():
     state_dict = torch.load(args.archive, map_location="cpu")
     step, metrics = state_dict["step_idx"], state_dict.get("metrics", {})
     print(f"  checkpoint step={step} metrics={metrics}", flush=True)
-    if os.environ.get("PERSONALLLM_LORA", "0") == "1":
-        # The checkpoint was written by a LoRA-wrapped policy (directpreferenceoptimization/train.py, PERSONALLLM_LORA=1): its keys are PeftModel keys (base_layer + lora_A/lora_B), so the
+    if os.environ.get("FSPO_LORA", "0") == "1":
+        # The checkpoint was written by a LoRA-wrapped policy (directpreferenceoptimization/train.py, FSPO_LORA=1): its keys are PeftModel keys (base_layer + lora_A/lora_B), so the
         # SAME LoraConfig (same env source as training: method_hyperparameters.py --method DPO's LORA_*) must wrap the model before load_state_dict(), then the adapter is merged for generation.
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(task_type="CAUSAL_LM", r=int(os.environ["LORA_R"]), lora_alpha=int(os.environ["LORA_ALPHA"]),

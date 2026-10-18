@@ -93,7 +93,7 @@ def main(config: DictConfig):
         policy.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         print('gradient checkpointing enabled (HF, non-reentrant) for the BasicTrainer policy')
 
-    # PERSONALLLM_LORA opt-in -- see chat: "does IPO use LoRa?!" -> "is it
+    # FSPO_LORA opt-in -- see chat: "does IPO use LoRa?!" -> "is it
     # trivial to change the fine-tuning to Lora in their code?" -> "I think
     # this is fair to the other methods... run a new sanity check with
     # fewshot=8 but a lora adaptor with the same parameters we've been
@@ -113,7 +113,7 @@ def main(config: DictConfig):
     # default off -- qwen's own existing full-fine-tuning pipeline stays
     # byte-identical unless a launcher explicitly opts in (same pattern as
     # PERSONALLLM_NUM_SHOTS).
-    if os.environ.get("PERSONALLLM_LORA", "0") == "1":
+    if os.environ.get("FSPO_LORA", "0") == "1":
         from peft import LoraConfig, get_peft_model
         # LoRA hyperparameters come from the SAME source of truth DPO / DPO-LRF / D-DPO use -- dpo_LRF/method_hyperparameters.py (LORA_R / LORA_ALPHA / LORA_DROPOUT /
         # LORA_TARGET_MODULES, exported by `method_hyperparameters.py --method DPO`), so "FSPO uses the same LoRA as DPO" is true by construction, not by a copy of the numbers
@@ -147,7 +147,7 @@ def main(config: DictConfig):
             config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=reference_model_dtype, **model_kwargs)
         disable_dropout(reference_model)
         # MUST also be LoRA-wrapped, same config as policy above, when
-        # PERSONALLLM_LORA=1 -- NOT for its own training (reference_model
+        # FSPO_LORA=1 -- NOT for its own training (reference_model
         # is never in self.optimizer's own parameter list, trainers.py's
         # own real mechanism, confirmed directly -- it's pure eval/no_grad
         # forward passes), but because config.model.archive's own
@@ -159,7 +159,7 @@ def main(config: DictConfig):
         # This also correctly represents WHAT the IPO stage's reference
         # actually needs to be: the SFT-tuned policy (base + its trained
         # adapter), not the raw pretrained model with no adapter at all.
-        if os.environ.get("PERSONALLLM_LORA", "0") == "1":
+        if os.environ.get("FSPO_LORA", "0") == "1":
             reference_model = get_peft_model(reference_model, lora_config)
             # Same float32-adapter-vs-bfloat16-base dtype fix as policy above.
             reference_model = reference_model.to(reference_model_dtype)

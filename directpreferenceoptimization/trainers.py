@@ -523,12 +523,12 @@ class FSDPTrainer(BasicTrainer):
         # instead of flattening the whole block together, which handles
         # mixed frozen/trainable params fine -- see chat: "can we fix the
         # previous problems with dim1/refproblog/prlhf/fspo?" -> LoRA
-        # sanity check thread. Scoped to PERSONALLLM_LORA=1 only -- the
+        # sanity check thread. Scoped to FSPO_LORA=1 only -- the
         # plain full-fine-tuning path (every param in a wrapped block
         # trainable alike) never hits this, and is already working/running
         # for other n10 methods, so its own use_orig_params=False stays
         # byte-identical unless a launcher explicitly opts into LoRA.
-        use_orig_params = os.environ.get("PERSONALLLM_LORA", "0") == "1"
+        use_orig_params = os.environ.get("FSPO_LORA", "0") == "1"
         shared_fsdp_kwargs = dict(
             auto_wrap_policy=model_auto_wrap_policy,
             sharding_strategy=ShardingStrategy.FULL_SHARD,
