@@ -134,9 +134,31 @@ def main():
         "local_dirs": [tempfile.gettempdir()],
     })
 
+    # FSPO_LORA=1 -- same env-var convention train.py itself reads (LORA_R/LORA_ALPHA/LORA_DROPOUT/
+    # LORA_TARGET_MODULES), already exported in the SAME shell session that just ran the IPO stage.
+    # Every checkpoint this script will actually be pointed at was trained with FSPO_LORA=1 (train.sh's
+    # own real recipe), so the saved state_dict is a PeftModel's (renamed/prefixed base keys + real
+    # new lora_A/lora_B tensors) -- loading it into a plain AutoModelForCausalLM fails with "Missing
+    # key(s)... model.layers.0.self_attn.q_proj.weight..." (job 338946's own real crash). Must wrap
+    # BOTH policy and reference_model in the identical LoraConfig train.py used, exactly like train.py
+    # itself does for its own reference_model when loading a LoRA archive.
+    lora_config = None
+    if os.environ.get("FSPO_LORA", "0") == "1":
+        from peft import LoraConfig, get_peft_model
+        if all(k in os.environ for k in ("LORA_R", "LORA_ALPHA", "LORA_DROPOUT", "LORA_TARGET_MODULES")):
+            _lora = dict(r=int(os.environ["LORA_R"]), lora_alpha=int(os.environ["LORA_ALPHA"]), lora_dropout=float(os.environ["LORA_DROPOUT"]),
+                         target_modules=os.environ["LORA_TARGET_MODULES"].split())
+        else:
+            print("WARNING: LORA_R/LORA_ALPHA/LORA_DROPOUT/LORA_TARGET_MODULES not exported -- using the hardcoded canonical DPO values (r=8, alpha=16, dropout=0.05, q_proj v_proj)")
+            _lora = dict(r=8, lora_alpha=16, lora_dropout=0.05, target_modules=["q_proj", "v_proj"])
+        lora_config = LoraConfig(task_type="CAUSAL_LM", **_lora)
+        print(f"LoRA config: {_lora}", flush=True)
+
     print(f"=== Loading policy (IPO checkpoint: {args.archive}) ===", flush=True)
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         args.model_name, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16)
+    if lora_config is not None:
+        policy = get_peft_model(policy, lora_config).to(torch.bfloat16)
     policy_state = torch.load(args.archive, map_location="cpu")
     print(f"  IPO checkpoint step={policy_state['step_idx']} metrics={policy_state.get('metrics', {})}", flush=True)
     policy.load_state_dict(policy_state["state"])
@@ -145,6 +167,8 @@ def main():
           f"training actually used, NOT the raw base model ===", flush=True)
     reference_model = transformers.AutoModelForCausalLM.from_pretrained(
         args.model_name, low_cpu_mem_usage=True, torch_dtype=torch.bfloat16)
+    if lora_config is not None:
+        reference_model = get_peft_model(reference_model, lora_config).to(torch.bfloat16)
     sft_state = torch.load(args.sft_archive, map_location="cpu")
     reference_model.load_state_dict(sft_state["state"])
 
