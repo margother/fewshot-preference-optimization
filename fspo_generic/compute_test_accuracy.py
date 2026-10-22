@@ -38,10 +38,16 @@ definition DPO uses, only the LOSS differs):
     rejected_reward = beta * (policy_rejected_logp - reference_rejected_logp)
     accuracy = mean(chosen_reward > rejected_reward)
 
+Dataset: was hardcoded to "personalllm" (PERSONALLLM_TEST_PATH/PERSONALLLM_TRAIN_PATH, datasets=["personalllm"]) --
+generalized to --dataset, same env_prefix mapping fspo_generic's own get_dataset() dispatch uses
+(personalllm/prism/community_alignment/roleplay_pairs), so this script can score PRISM/CA/Roleplay
+checkpoints too, not just the original personalllm/qwen one.
+
 Usage:
     python compute_test_accuracy.py \\
-        --archive /path/to/personalllm_seen_ipo_TIMESTAMP/LATEST/policy.pt \\
-        --sft-archive /path/to/personalllm_seen_sft_TIMESTAMP/LATEST/policy.pt \\
+        --dataset prism \\
+        --archive /path/to/prism_seen_ipo_TIMESTAMP/LATEST/policy.pt \\
+        --sft-archive /path/to/prism_seen_sft_TIMESTAMP/LATEST/policy.pt \\
         --test-path /path/to/test.json \\
         --output-path /path/to/test_accuracy.json
 """
@@ -61,8 +67,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from trainers import BasicTrainer
 
 
+_ENV_PREFIX = {"personalllm": "PERSONALLLM", "prism": "PRISM", "community_alignment": "CA", "roleplay_pairs": "ROLEPLAY"}
+
+
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--dataset", default="personalllm", choices=list(_ENV_PREFIX.keys()),
+                    help="Same dataset names/env-var-prefix mapping as fspo_generic/dataset_data.py's "
+                         "own get_dataset() dispatch.")
     p.add_argument("--archive", required=True, help="train_seen.sh's own IPO stage output -- "
                     "<run_dir>/LATEST/policy.pt.")
     p.add_argument("--sft-archive", required=True, help="train_seen.sh's own SFT stage output -- "
@@ -79,8 +91,8 @@ def parse_args():
                     help="MUST match the checkpoint's own training loss.beta -- doesn't affect "
                          "accuracy itself (beta-invariant sign comparison, see module docstring), "
                          "kept correct for clarity, same as the P-RLHF script's own --beta.")
-    p.add_argument("--max-prompt-length", type=int, default=5632)
-    p.add_argument("--max-length", type=int, default=6144)
+    p.add_argument("--max-prompt-length", type=int, default=4608)
+    p.add_argument("--max-length", type=int, default=5632)
     p.add_argument("--n-eval-examples", type=int, default=256,
                     help="Caps the windowed test set the same way train.py's own default "
                          "n_eval_examples (256, config.yaml) does -- NOT the full test.json, see "
@@ -93,9 +105,10 @@ def main():
     args = parse_args()
     t0 = time.time()
 
-    os.environ["PERSONALLLM_TEST_PATH"] = args.test_path
+    env_prefix = _ENV_PREFIX[args.dataset]
+    os.environ[f"{env_prefix}_TEST_PATH"] = args.test_path
     # Tiny dummy train file -- see module docstring. Needs >= num_shots+2 rows for >= 1 user so
-    # get_personalllm()'s own windowing doesn't produce an empty train_iterator (harmless either
+    # get_fewshot_dataset()'s own windowing doesn't produce an empty train_iterator (harmless either
     # way here, but avoids a confusing "0 batches" print).
     dummy_rows = [
         {"user_id": "dummy_user", "prompt": f"dummy prompt {i}", "chosen": "a", "rejected": "b"}
@@ -104,10 +117,10 @@ def main():
     dummy_train_path = os.path.join(tempfile.gettempdir(), f"fspo_dummy_train_{os.getpid()}.json")
     with open(dummy_train_path, "w") as f:
         json.dump(dummy_rows, f)
-    os.environ["PERSONALLLM_TRAIN_PATH"] = dummy_train_path
+    os.environ[f"{env_prefix}_TRAIN_PATH"] = dummy_train_path
 
     config = OmegaConf.create({
-        "datasets": ["personalllm"],
+        "datasets": [args.dataset],
         "max_length": args.max_length,
         "max_prompt_length": args.max_prompt_length,
         "batch_size": 2,          # throwaway train_iterator only -- never used, see module docstring.
