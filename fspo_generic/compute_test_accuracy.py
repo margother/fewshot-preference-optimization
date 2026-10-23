@@ -174,6 +174,11 @@ def main():
 
     policy.cuda()
     reference_model.cuda()
+    for _name, _model in (("policy", policy), ("reference_model", reference_model)):
+        for _pname, _p in _model.named_parameters():
+            if _p.device.type != "cuda":
+                print(f"[DEBUG] {_name}.{_pname} is on {_p.device} (not cuda) -- "
+                      f"shape={tuple(_p.shape)}, requires_grad={_p.requires_grad}", flush=True)
     reference_model.eval()
 
     print("=== Building BasicTrainer (rank=0, world_size=1 -- eval-only, no FSDP needed) ===", flush=True)
