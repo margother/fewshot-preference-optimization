@@ -65,6 +65,7 @@ from omegaconf import OmegaConf
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "directpreferenceoptimization"))
 from trainers import BasicTrainer
+from utils import slice_and_move_batch_for_device
 
 
 _ENV_PREFIX = {"personalllm": "PERSONALLLM", "prism": "PRISM", "community_alignment": "CA", "roleplay_pairs": "ROLEPLAY"}
@@ -174,11 +175,6 @@ def main():
 
     policy.cuda()
     reference_model.cuda()
-    for _name, _model in (("policy", policy), ("reference_model", reference_model)):
-        for _pname, _p in _model.named_parameters():
-            if _p.device.type != "cuda":
-                print(f"[DEBUG] {_name}.{_pname} is on {_p.device} (not cuda) -- "
-                      f"shape={tuple(_p.shape)}, requires_grad={_p.requires_grad}", flush=True)
     reference_model.eval()
 
     print("=== Building BasicTrainer (rank=0, world_size=1 -- eval-only, no FSDP needed) ===", flush=True)
@@ -191,6 +187,13 @@ def main():
     all_accuracies = []
     with torch.no_grad():
         for i, batch in enumerate(trainer.eval_batches):
+            # The real training loop ALWAYS moves a batch to its target device via
+            # slice_and_move_batch_for_device() before using it (trainers.py's own train()/eval
+            # call sites) -- this script skipped that step entirely, leaving eval_batches' tensors
+            # on CPU while the model is on cuda -- job 339062's real crash: "Expected all tensors
+            # to be on the same device, but found at least two devices, cuda:0 and cpu!" inside
+            # embed_tokens. rank=0, world_size=1 (single-GPU eval) -- same as this trainer's own.
+            batch = slice_and_move_batch_for_device(batch, 0, 1, 0)
             _, metrics = trainer.get_batch_metrics(batch, config.loss, train=False)
             all_accuracies.extend(metrics["rewards_eval/accuracies"])
             if (i + 1) % 20 == 0:
