@@ -83,6 +83,15 @@ def parse_args():
     p.add_argument("--test-path", required=True,
                     help="Raw test.json (user_id/prompt/chosen/rejected rows) -- the SAME held-out "
                          "split dim1/dim3/P-RLHF's own accuracy blocks use.")
+    p.add_argument("--shots-path", default=None,
+                   help="OPTIONAL. The user's real train/adaptation pool (same row shape as --test-path) "
+                        "to draw few-shot CONTEXT from instead of --test-path -- fixes this script's own "
+                        "leakage (shots and scored target both windowed from the SAME test split by "
+                        "default, the original FSPO authors' own convention; see module docstring). Pass "
+                        "the SEEN population's train.json for a seen checkpoint, or the UNSEEN "
+                        "population's own adaptation-pool train.json (e.g. the *_ntrain128 one) for an "
+                        "unseen one -- same split eval/generate.py's own fspo branch already uses for "
+                        "the real win-rate generations. Omit to reproduce the original (leakier) protocol.")
     p.add_argument("--output-path", required=True)
     p.add_argument("--model-name", default="Qwen/Qwen3-0.6B")
     p.add_argument("--num-shots", type=int, default=4,
@@ -108,6 +117,8 @@ def main():
 
     env_prefix = _ENV_PREFIX[args.dataset]
     os.environ[f"{env_prefix}_TEST_PATH"] = args.test_path
+    if args.shots_path:
+        os.environ[f"{env_prefix}_SHOTS_PATH"] = args.shots_path
     # Tiny dummy train file -- see module docstring. Needs >= num_shots+2 rows for >= 1 user so
     # get_fewshot_dataset()'s own windowing doesn't produce an empty train_iterator (harmless either
     # way here, but avoids a confusing "0 batches" print).

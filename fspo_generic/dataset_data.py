@@ -86,6 +86,49 @@ def get_fewshot_dataset(
     for r in rows:
         by_user[r["user_id"]].append(r)
 
+    # Opt-in fix for compute_test_accuracy.py's own leakage (its few-shot CONTEXT and its scored
+    # TARGET were both windowed from the SAME held-out test split -- the original FSPO authors'
+    # own convention, see that script's module docstring): when {env_prefix}_SHOTS_PATH is set
+    # (split=='test' only), shots come from THAT file (the real train/adaptation pool) instead of
+    # from `rows` -- see chat: "I guess for the unseen users, we should use the adaptation set,
+    # and for the seen users, the training set" -> "why not use this for preference accuracy?!".
+    # train.py's own real eval-every logging never sets this, so it is completely unaffected.
+    shots_path = os.environ.get(f"{env_prefix}_SHOTS_PATH") if split == "test" else None
+    if shots_path:
+        with open(shots_path) as f:
+            shots_rows = json.load(f)
+        shots_by_user = defaultdict(list)
+        for r in shots_rows:
+            shots_by_user[r["user_id"]].append(r)
+        data = defaultdict(lambda: defaultdict(list))
+        n_skipped_no_shots = 0
+        for user_id, user_rows in by_user.items():
+            pool = shots_by_user.get(user_id, [])
+            if len(pool) < num_shots:
+                n_skipped_no_shots += len(user_rows)
+                continue
+            pool = pool[:]
+            random.shuffle(pool)
+            shots = pool[:num_shots]
+            fewshot_prompts = [s["prompt"] for s in shots]
+            fewshot_preferred = [s["chosen"] for s in shots]
+            fewshot_dispreferred = [s["rejected"] for s in shots]
+            for target in user_rows:
+                prompt, chosen, rejected = shots_to_text(
+                    fewshot_prompts=fewshot_prompts, fewshot_preferred=fewshot_preferred,
+                    fewshot_dispreferred=fewshot_dispreferred, final_question=target["prompt"],
+                    final_chosen=target["chosen"], final_rejected=target["rejected"],
+                    include_dispreferred=include_disprefferred, add_persona=False,
+                )
+                n_responses = len(data[prompt]["responses"])
+                data[prompt]["pairs"].append((n_responses, n_responses + 1))
+                data[prompt]["responses"].extend([chosen, rejected])
+                data[prompt]["sft_target"].extend([chosen, rejected])
+        if n_skipped_no_shots and not silent:
+            print(f"get_fewshot_dataset: {n_skipped_no_shots} test rows skipped (their user has fewer than "
+                  f"{num_shots} rows in {shots_path})")
+        return data
+
     data = defaultdict(lambda: defaultdict(list))
     for _ in range(2 * (num_shots + 1)):
         for user_id, user_rows in by_user.items():
