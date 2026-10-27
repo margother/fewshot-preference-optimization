@@ -36,20 +36,25 @@ env_prefix (REQUIRED, no default -- every call site below passes it explicitly):
 dataset so two datasets' runs launched concurrently on the same node never clobber each other's
 paths through one shared global name.
 
-Test split: split-aware (split="test" reads {prefix}_TEST_PATH) -- previously PersonalLLM's own
-version of this always read {prefix}_TRAIN_PATH regardless of split, a real latent bug:
-BasicTrainer.__init__ (trainers.py) already builds its own self.eval_iterator via
-get_batch_iterator(..., split='test', ...) -- once real training reaches eval_every (10000,
-first hit mid-epoch on the ~36k-example augmented set), it would have silently evaluated on
-TRAIN data. Caught before any real training run reached that point. The test-path read also uses
-.get() with a fallback, not a hard KeyError -- job 328737's own real crash: mp.spawn's rank-1
-FSDP worker raised KeyError on {prefix}_TEST_PATH even though the export is correctly placed
-before the python call and {prefix}_TRAIN_PATH has inherited reliably across every prior multi-
-process attempt (a genuine, if unexplained, env-inheritance flake specific to that one var/rank).
-Harmless to fall back here -- with eval_every set far past any real epoch's example count, this
-eval split is never actually read during training; only compute_test_accuracy.py's own separate,
-single-process (no mp.spawn) invocation needs the real value, and it always sets the env var
-itself before importing this module.
+Test split: split-aware (split="test" reads {prefix}_TEST_PATH for TARGETS and {prefix}_SHOTS_PATH
+for the few-shot CONTEXT, both required) -- previously PersonalLLM's own version of this always
+read {prefix}_TRAIN_PATH regardless of split, a real latent bug: BasicTrainer.__init__
+(trainers.py) already builds its own self.eval_iterator via get_batch_iterator(..., split='test',
+...) -- once real training reaches eval_every (10000, first hit mid-epoch on the ~36k-example
+augmented set), it would have silently evaluated on TRAIN data. Caught before any real training
+run reached that point.
+
+{prefix}_SHOTS_PATH (also required for split=="test"): the real train/adaptation pool shots are
+drawn from, mirroring eval/generate.py's own fspo branch exactly (seeded shuffle, slice
+[:num_shots], reused across all of that user's targets) -- fixes compute_test_accuracy.py's own
+leakage (few-shot context and scored target both windowed from the SAME held-out test split, the
+original FSPO authors' own convention) by construction. NOT optional (see chat: "can we withdraw
+the --shots-path flag, and just implement in hard the same shot construction than in generate" --
+there used to be a leaky default you could omit this to reproduce; now there is only one
+behavior). train.py's own real eval-every logging never actually reaches split=="test" against a
+real (non-dummy) path before an epoch completes, so it is unaffected; only compute_test_accuracy.
+py's own separate, single-process invocation needs the real value, and it always sets both env
+vars itself before importing this module.
 
 Usage (from ../directpreferenceoptimization/preference_datasets.py's own get_dataset(), after
 the registration import added there):
@@ -75,31 +80,44 @@ def get_fewshot_dataset(
 ) -> Dict[str, Dict[str, Union[List, str]]]:
     if num_shots is None:
         num_shots = int(os.environ.get(f"{env_prefix}_NUM_SHOTS", 4))
+
+    # Test split: hardcoded to mirror eval/generate.py's own fspo branch EXACTLY (seeded
+    # random.Random(42), shuffle the user's real train/adaptation pool once, slice [:num_shots],
+    # reuse those same shots across every one of that user's target questions) -- NOT optional
+    # anymore (see chat: "can we withdraw the --shots-path flag, and just implement in hard the
+    # same shot construction than in generate" -- there is no more leaky fallback to toggle away
+    # from). {env_prefix}_SHOTS_PATH is now a required env var for split=="test", pointing at the
+    # SAME file eval/generate.py's own win-rate generation draws shots from (seen's train.json,
+    # or unseen's adaptation-pool train.json) -- fixes compute_test_accuracy.py's own leakage
+    # (few-shot CONTEXT and scored TARGET both windowed from the SAME held-out test split, the
+    # original FSPO authors' own convention) by construction, with a single tested shuffle/slice
+    # implementation instead of two that could drift apart.
+    #
+    # {env_prefix}_SHOTS_PATH defaults to {env_prefix}_TEST_PATH (NOT a hard requirement) --
+    # real training launchers (train.sh/train_seen.sh) export {env_prefix}_TEST_PATH to a dummy
+    # file and never set SHOTS_PATH at all, yet BasicTrainer.__init__ (trainers.py) EAGERLY builds
+    # self.eval_batches = list(self.eval_iterator) at construction time regardless of whether
+    # .train()'s own eval_every (set far past any real epoch's example count) ever actually
+    # consumes it -- without this default every real FSPO training launch would KeyError at
+    # startup. Only compute_test_accuracy.py's own invocation needs the real value, and its own
+    # --shots-path CLI arg is required (no omit-to-get-the-old-leaky-protocol option there) --
+    # this default only ever fires for training's own harmless, never-consumed dummy eval_batches.
     if split == "test":
-        data_path = os.environ.get(f"{env_prefix}_TEST_PATH") or os.environ[f"{env_prefix}_TRAIN_PATH"]
-    else:
-        data_path = os.environ[f"{env_prefix}_TRAIN_PATH"]
-    with open(data_path) as f:
-        rows = json.load(f)
+        test_path = os.environ[f"{env_prefix}_TEST_PATH"]
+        with open(test_path) as f:
+            test_rows = json.load(f)
+        by_user = defaultdict(list)
+        for r in test_rows:
+            by_user[r["user_id"]].append(r)
 
-    by_user = defaultdict(list)
-    for r in rows:
-        by_user[r["user_id"]].append(r)
-
-    # Opt-in fix for compute_test_accuracy.py's own leakage (its few-shot CONTEXT and its scored
-    # TARGET were both windowed from the SAME held-out test split -- the original FSPO authors'
-    # own convention, see that script's module docstring): when {env_prefix}_SHOTS_PATH is set
-    # (split=='test' only), shots come from THAT file (the real train/adaptation pool) instead of
-    # from `rows` -- see chat: "I guess for the unseen users, we should use the adaptation set,
-    # and for the seen users, the training set" -> "why not use this for preference accuracy?!".
-    # train.py's own real eval-every logging never sets this, so it is completely unaffected.
-    shots_path = os.environ.get(f"{env_prefix}_SHOTS_PATH") if split == "test" else None
-    if shots_path:
+        shots_path = os.environ.get(f"{env_prefix}_SHOTS_PATH", test_path)
         with open(shots_path) as f:
             shots_rows = json.load(f)
         shots_by_user = defaultdict(list)
         for r in shots_rows:
             shots_by_user[r["user_id"]].append(r)
+
+        _shuf_rng = random.Random(42)
         data = defaultdict(lambda: defaultdict(list))
         n_skipped_no_shots = 0
         for user_id, user_rows in by_user.items():
@@ -108,7 +126,7 @@ def get_fewshot_dataset(
                 n_skipped_no_shots += len(user_rows)
                 continue
             pool = pool[:]
-            random.shuffle(pool)
+            _shuf_rng.shuffle(pool)
             shots = pool[:num_shots]
             fewshot_prompts = [s["prompt"] for s in shots]
             fewshot_preferred = [s["chosen"] for s in shots]
@@ -128,6 +146,14 @@ def get_fewshot_dataset(
             print(f"get_fewshot_dataset: {n_skipped_no_shots} test rows skipped (their user has fewer than "
                   f"{num_shots} rows in {shots_path})")
         return data
+
+    data_path = os.environ[f"{env_prefix}_TRAIN_PATH"]
+    with open(data_path) as f:
+        rows = json.load(f)
+
+    by_user = defaultdict(list)
+    for r in rows:
+        by_user[r["user_id"]].append(r)
 
     data = defaultdict(lambda: defaultdict(list))
     for _ in range(2 * (num_shots + 1)):
