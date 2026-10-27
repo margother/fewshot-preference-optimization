@@ -21,20 +21,27 @@ ACTUALLY trained against, not some other baseline.
 
 Test split: get_fewshot_dataset() is split-aware (see fspo_generic/
 dataset_data.py's own comment) -- split="test" reads PERSONALLLM_
-TEST_PATH for the scored TARGET question/chosen/rejected, and (required,
---shots-path below) PERSONALLLM_SHOTS_PATH for the few-shot CONTEXT,
-built with the SAME seeded shuffle+slice eval/generate.py's own fspo
-branch uses for the real win-rate generations -- NOT the leaky "both from
-the same held-out test split" protocol get_elix/get_review/get_roleplay
-use for their own train/test symmetry (there used to be an opt-in fix for
-this with a leaky fallback if omitted; now there is only the fixed
-behavior, see chat: "can we withdraw the --shots-path flag, and just
-implement in hard the same shot construction than in generate"). PERSONALLLM_
-TRAIN_PATH is pointed at a tiny 2-row dummy file (BasicTrainer.__init__
+TEST_PATH for the scored TARGET question/chosen/rejected, and (same
+PERSONALLLM_TRAIN_PATH split="train" already needs -- NO separate
+"shots path" flag/env-var, see chat: "but wait, I said to not use a flag
+and just hard code, exactly how we did for generate") for the few-shot
+CONTEXT, built with the SAME seeded shuffle+slice eval/generate.py's own
+fspo branch uses for the real win-rate generations -- NOT the leaky "both
+from the same held-out test split" protocol get_elix/get_review/
+get_roleplay use for their own train/test symmetry.
+
+--train-path below must be the REAL train/adaptation pool (same row shape
+as --test-path) -- pass the SEEN population's train.json for a seen
+checkpoint, or the UNSEEN population's own adaptation-pool train.json
+(e.g. the *_ntrain128 one) for an unseen one, same split eval/generate.
+py's own fspo branch already uses for the real win-rate generations. This
+means the OLD "tiny 2-row dummy train file" trick (BasicTrainer.__init__
 unconditionally builds a train_iterator too, even though .train() is
-never called here -- a real dummy avoids re-running the ~36k-example
-reshuffle-augmentation on the full train.json for nothing, same fix as
-the P-RLHF script's own dummy_train_dataset).
+never called here -- a dummy avoided re-running the ~36k-example reshuffle-
+augmentation on the full train.json for nothing, same trick as the P-RLHF
+script's own dummy_train_dataset) is NO LONGER POSSIBLE: the real pool is
+now needed either way, so that one-time unused-train_iterator cost is
+accepted rather than special-cased away.
 
 Formula (trainers.py's own preference_loss, ipo=True branch -- SAME reward
 definition DPO uses, only the LOSS differs):
@@ -53,7 +60,7 @@ Usage:
         --archive /path/to/prism_seen_ipo_TIMESTAMP/LATEST/policy.pt \\
         --sft-archive /path/to/prism_seen_sft_TIMESTAMP/LATEST/policy.pt \\
         --test-path /path/to/test.json \\
-        --shots-path /path/to/train.json \\
+        --train-path /path/to/train.json \\
         --output-path /path/to/test_accuracy.json
 """
 import argparse
@@ -88,17 +95,19 @@ def parse_args():
     p.add_argument("--test-path", required=True,
                     help="Raw test.json (user_id/prompt/chosen/rejected rows) -- the SAME held-out "
                          "split dim1/dim3/P-RLHF's own accuracy blocks use.")
-    p.add_argument("--shots-path", required=True,
-                   help="REQUIRED. The user's real train/adaptation pool (same row shape as --test-path) "
-                        "to draw few-shot CONTEXT from instead of --test-path -- fixes this script's own "
-                        "leakage (shots and scored target both windowed from the SAME test split, the "
-                        "original FSPO authors' own convention; see dataset_data.py's module docstring). "
-                        "Pass the SEEN population's train.json for a seen checkpoint, or the UNSEEN "
-                        "population's own adaptation-pool train.json (e.g. the *_ntrain128 one) for an "
-                        "unseen one -- same split eval/generate.py's own fspo branch already uses for "
-                        "the real win-rate generations. No leaky fallback exists anymore -- this is the "
-                        "only behavior (see chat: \"can we withdraw the --shots-path flag, and just "
-                        "implement in hard the same shot construction than in generate\").")
+    p.add_argument("--train-path", required=True,
+                   help="REQUIRED, and must be the REAL train/adaptation pool (same row shape as "
+                        "--test-path), NOT a dummy file -- used both as split=\"train\"'s own source "
+                        "(BasicTrainer's unused throwaway train_iterator) AND, since there is no "
+                        "separate shots-path flag (see chat: \"but wait, I said to not use a flag and "
+                        "just hard code, exactly how we did for generate\"), as split=\"test\"'s own "
+                        "few-shot CONTEXT source -- fixes this script's own leakage (shots and scored "
+                        "target both windowed from the SAME test split, the original FSPO authors' own "
+                        "convention; see dataset_data.py's module docstring). Pass the SEEN "
+                        "population's train.json for a seen checkpoint, or the UNSEEN population's own "
+                        "adaptation-pool train.json (e.g. the *_ntrain128 one) for an unseen one -- same "
+                        "split eval/generate.py's own fspo branch already uses for the real win-rate "
+                        "generations.")
     p.add_argument("--output-path", required=True)
     p.add_argument("--model-name", default="Qwen/Qwen3-0.6B")
     p.add_argument("--num-shots", type=int, default=4,
@@ -124,18 +133,11 @@ def main():
 
     env_prefix = _ENV_PREFIX[args.dataset]
     os.environ[f"{env_prefix}_TEST_PATH"] = args.test_path
-    os.environ[f"{env_prefix}_SHOTS_PATH"] = args.shots_path
-    # Tiny dummy train file -- see module docstring. Needs >= num_shots+2 rows for >= 1 user so
-    # get_fewshot_dataset()'s own windowing doesn't produce an empty train_iterator (harmless either
-    # way here, but avoids a confusing "0 batches" print).
-    dummy_rows = [
-        {"user_id": "dummy_user", "prompt": f"dummy prompt {i}", "chosen": "a", "rejected": "b"}
-        for i in range(args.num_shots + 2)
-    ]
-    dummy_train_path = os.path.join(tempfile.gettempdir(), f"fspo_dummy_train_{os.getpid()}.json")
-    with open(dummy_train_path, "w") as f:
-        json.dump(dummy_rows, f)
-    os.environ[f"{env_prefix}_TRAIN_PATH"] = dummy_train_path
+    # The REAL pool -- no more dummy-file trick (see module docstring): split=="test" now reads
+    # its few-shot CONTEXT from this SAME env var, so it must be the real train/adaptation pool.
+    # BasicTrainer.__init__ still builds an unused train_iterator from it too (split=="train");
+    # that one-time cost is accepted rather than special-cased away with a dummy.
+    os.environ[f"{env_prefix}_TRAIN_PATH"] = args.train_path
 
     config = OmegaConf.create({
         "datasets": [args.dataset],
@@ -144,7 +146,7 @@ def main():
         "batch_size": 2,          # throwaway train_iterator only -- never used, see module docstring.
         "eval_batch_size": args.eval_batch_size,
         "n_epochs": None,
-        "n_examples": 2,          # throwaway train_iterator cap, matches the dummy file's own tiny size.
+        "n_examples": 2,          # throwaway train_iterator cap -- never used, kept tiny regardless.
         "n_eval_examples": args.n_eval_examples,
         "trainer": "BasicTrainer",
         "loss": {"name": "ipo", "beta": args.beta},
@@ -233,7 +235,6 @@ def main():
         }, f, indent=2)
     print(f"wrote {args.output_path}", flush=True)
 
-    os.remove(dummy_train_path)
     print("[INFO] Script execution completed successfully.", flush=True)
 
 

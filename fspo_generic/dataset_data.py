@@ -36,25 +36,26 @@ env_prefix (REQUIRED, no default -- every call site below passes it explicitly):
 dataset so two datasets' runs launched concurrently on the same node never clobber each other's
 paths through one shared global name.
 
-Test split: split-aware (split="test" reads {prefix}_TEST_PATH for TARGETS and {prefix}_SHOTS_PATH
-for the few-shot CONTEXT, both required) -- previously PersonalLLM's own version of this always
-read {prefix}_TRAIN_PATH regardless of split, a real latent bug: BasicTrainer.__init__
-(trainers.py) already builds its own self.eval_iterator via get_batch_iterator(..., split='test',
-...) -- once real training reaches eval_every (10000, first hit mid-epoch on the ~36k-example
-augmented set), it would have silently evaluated on TRAIN data. Caught before any real training
-run reached that point.
+Test split: split-aware (split="test" reads {prefix}_TEST_PATH for TARGETS, same as before) --
+previously PersonalLLM's own version of this always read {prefix}_TRAIN_PATH regardless of split,
+a real latent bug: BasicTrainer.__init__ (trainers.py) already builds its own self.eval_iterator
+via get_batch_iterator(..., split='test', ...) -- once real training reaches eval_every (10000,
+first hit mid-epoch on the ~36k-example augmented set), it would have silently evaluated on TRAIN
+data. Caught before any real training run reached that point.
 
-{prefix}_SHOTS_PATH (also required for split=="test"): the real train/adaptation pool shots are
-drawn from, mirroring eval/generate.py's own fspo branch exactly (seeded shuffle, slice
-[:num_shots], reused across all of that user's targets) -- fixes compute_test_accuracy.py's own
-leakage (few-shot context and scored target both windowed from the SAME held-out test split, the
-original FSPO authors' own convention) by construction. NOT optional (see chat: "can we withdraw
-the --shots-path flag, and just implement in hard the same shot construction than in generate" --
-there used to be a leaky default you could omit this to reproduce; now there is only one
-behavior). train.py's own real eval-every logging never actually reaches split=="test" against a
-real (non-dummy) path before an epoch completes, so it is unaffected; only compute_test_accuracy.
-py's own separate, single-process invocation needs the real value, and it always sets both env
-vars itself before importing this module.
+The few-shot CONTEXT for split=="test" now ALSO comes from {prefix}_TRAIN_PATH -- NO separate
+"shots path" flag/env-var (see chat: "but wait, I said to not use a flag and just hard code,
+exactly how we did for generate" -- eval/generate.py has no shots-specific arg either, every
+branch there just reads its adaptation pool from the one --train-path it's given). Mirrors
+eval/generate.py's own fspo branch exactly: seeded shuffle, slice [:num_shots], reused across all
+of that user's targets. Fixes compute_test_accuracy.py's own leakage (few-shot context and scored
+target both windowed from the SAME held-out test split, the original FSPO authors' own
+convention) by construction, with a single tested shuffle/slice implementation instead of a second
+one that could drift. train.py's own real training launchers already export the REAL train.json
+as {prefix}_TRAIN_PATH regardless (split=="train" needs it too), so this is never a new
+requirement for them; only compute_test_accuracy.py's own separate, single-process invocation
+previously got away with a tiny DUMMY {prefix}_TRAIN_PATH (see its own module docstring) -- it
+must now export the real pool there instead.
 
 Usage (from ../directpreferenceoptimization/preference_datasets.py's own get_dataset(), after
 the registration import added there):
@@ -83,25 +84,20 @@ def get_fewshot_dataset(
 
     # Test split: hardcoded to mirror eval/generate.py's own fspo branch EXACTLY (seeded
     # random.Random(42), shuffle the user's real train/adaptation pool once, slice [:num_shots],
-    # reuse those same shots across every one of that user's target questions) -- NOT optional
-    # anymore (see chat: "can we withdraw the --shots-path flag, and just implement in hard the
-    # same shot construction than in generate" -- there is no more leaky fallback to toggle away
-    # from). {env_prefix}_SHOTS_PATH is now a required env var for split=="test", pointing at the
-    # SAME file eval/generate.py's own win-rate generation draws shots from (seen's train.json,
-    # or unseen's adaptation-pool train.json) -- fixes compute_test_accuracy.py's own leakage
-    # (few-shot CONTEXT and scored TARGET both windowed from the SAME held-out test split, the
-    # original FSPO authors' own convention) by construction, with a single tested shuffle/slice
-    # implementation instead of two that could drift apart.
-    #
-    # {env_prefix}_SHOTS_PATH defaults to {env_prefix}_TEST_PATH (NOT a hard requirement) --
-    # real training launchers (train.sh/train_seen.sh) export {env_prefix}_TEST_PATH to a dummy
-    # file and never set SHOTS_PATH at all, yet BasicTrainer.__init__ (trainers.py) EAGERLY builds
-    # self.eval_batches = list(self.eval_iterator) at construction time regardless of whether
-    # .train()'s own eval_every (set far past any real epoch's example count) ever actually
-    # consumes it -- without this default every real FSPO training launch would KeyError at
-    # startup. Only compute_test_accuracy.py's own invocation needs the real value, and its own
-    # --shots-path CLI arg is required (no omit-to-get-the-old-leaky-protocol option there) --
-    # this default only ever fires for training's own harmless, never-consumed dummy eval_batches.
+    # reuse those same shots across every one of that user's target questions) -- NO separate
+    # "shots path" flag/env-var at all (see chat: "but wait, I said to not use a flag and just
+    # hard code, exactly how we did for generate" -- generate.py has no shots-specific arg
+    # either, it just reads shots from the SAME --train-path every other branch loads its
+    # adaptation pool from). So here too: shots for split=="test" come from the SAME
+    # {env_prefix}_TRAIN_PATH env var split=="train" already reads below, no second path to
+    # keep in sync. Fixes compute_test_accuracy.py's own leakage (few-shot CONTEXT and scored
+    # TARGET both windowed from the SAME held-out test split, the original FSPO authors' own
+    # convention) by construction, with a single tested shuffle/slice implementation instead of
+    # two that could drift. Real training launchers already export {env_prefix}_TRAIN_PATH to
+    # the real train.json (needed for split=="train" regardless), so this never breaks them --
+    # unlike compute_test_accuracy.py's own dummy-TRAIN_PATH trick (see its own module docstring),
+    # which is no longer possible: it must now export the REAL train/adaptation pool as
+    # {env_prefix}_TRAIN_PATH, same as every real train.sh launcher already does.
     if split == "test":
         test_path = os.environ[f"{env_prefix}_TEST_PATH"]
         with open(test_path) as f:
@@ -110,7 +106,7 @@ def get_fewshot_dataset(
         for r in test_rows:
             by_user[r["user_id"]].append(r)
 
-        shots_path = os.environ.get(f"{env_prefix}_SHOTS_PATH", test_path)
+        shots_path = os.environ[f"{env_prefix}_TRAIN_PATH"]
         with open(shots_path) as f:
             shots_rows = json.load(f)
         shots_by_user = defaultdict(list)
